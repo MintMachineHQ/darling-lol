@@ -12,6 +12,9 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('nix_common', ROOT / 'scripts/common.py')
+nix_common = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(nix_common)
 
 
 def run(*args, cwd=None, env=None):
@@ -524,6 +527,43 @@ class SessionTests(unittest.TestCase):
         self.assertIn('stamp-base', text)
         self.assertIn('invalidate-base', text)
         self.assertIn('nix-state.py', text)
+
+
+class LfsPointerTests(unittest.TestCase):
+    def setUp(self):
+        if run('git', 'lfs', 'version').returncode:
+            self.skipTest('git-lfs is not installed')
+        self.tmp = tempfile.TemporaryDirectory(prefix='lfs-pointer-test-')
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = Path(self.tmp.name) / 'repo'
+        init(self.repo)
+        git(self.repo, 'lfs', 'install', '--local')
+        git(self.repo, 'lfs', 'track', '*.bin')
+
+    def commit(self, content):
+        (self.repo / 'asset.bin').write_bytes(content)
+        git(self.repo, 'add', '.gitattributes', 'asset.bin')
+        git(self.repo, 'commit', '-m', 'asset')
+
+    def test_pointer_text_is_detected_even_when_lfs_reports_the_object(self):
+        # git lfs ls-files trusts the worktree size: when pointer text and object
+        # are the same length it prints * even though the worktree is a pointer.
+        payload = b'a' * 128
+        oid = hashlib.sha256(payload).hexdigest()
+        pointer = ('version https://git-lfs.github.com/spec/v1\n'
+                   'oid sha256:%s\nsize %d\n' % (oid, len(payload))).encode()
+        self.assertEqual(len(pointer), len(payload))
+        self.commit(payload)
+        (self.repo / 'asset.bin').write_bytes(pointer)
+        self.assertIn('*', git(self.repo, 'lfs', 'ls-files'))
+        self.assertEqual(nix_common.lfs_pointers(self.repo), ['asset.bin'])
+
+    def test_real_content_is_not_a_pointer(self):
+        self.commit(b'\x7fELF not a pointer\n' + b'x' * 2000)
+        self.assertEqual(nix_common.lfs_pointers(self.repo), [])
+
+    def test_missing_file_is_not_reported_as_pointer_text(self):
+        self.assertEqual(nix_common.lfs_pointers(self.repo), [])
 
 
 if __name__ == '__main__':

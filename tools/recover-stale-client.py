@@ -250,6 +250,27 @@ def wait_for_exit(prefix, identities, proc_root=Path('/proc'), sleep=time.sleep,
     return leftovers
 
 
+def leftover_message(leftovers, proc_root=Path('/proc')):
+    """Describe what survived, without promising that live processes will be reaped."""
+    zombies = [pid for pid in leftovers
+               if process_state(proc_root / str(pid)) == 'Z']
+    live = [pid for pid in leftovers if pid not in zombies]
+    parents = sorted({parent_pid(proc_root / str(pid)) for pid in leftovers} - {None})
+    kinds = []
+    if zombies:
+        kinds.append('%d zombie(s)' % len(zombies))
+    if live:
+        kinds.append('%d live process(es)' % len(live))
+    message = ('%d process(es) still present after SIGKILL (%s; parent PID(s): %s)'
+               % (len(leftovers), ', '.join(kinds),
+                  ', '.join(str(parent) for parent in parents) or 'unknown'))
+    if zombies:
+        message += '; the guest launchd reaps untracked zombies within seconds'
+    if live:
+        message += '; live survivors need a full runtime restart'
+    return message
+
+
 def recover(prefix, proc_root=Path('/proc'), window_check=visible_client_window,
             kill=os.kill, sleep=time.sleep, out=sys.stdout):
     if not server_running(proc_root):
@@ -280,10 +301,7 @@ def recover(prefix, proc_root=Path('/proc'), window_check=visible_client_window,
     _signal_tree(prefix, identities, order, signal.SIGKILL, kill, proc_root)
     leftovers = wait_for_exit(prefix, identities, proc_root, sleep)
     if leftovers:
-        parents = sorted({parent_pid(proc_root / str(pid)) for pid in leftovers} - {None})
-        print('recover-stale-client: %d process(es) still present after SIGKILL '
-              '(parent PID(s): %s); the guest launchd reaps untracked zombies within '
-              'seconds' % (len(leftovers), ', '.join(str(p) for p in parents) or 'unknown'),
+        print('recover-stale-client: %s' % leftover_message(leftovers, proc_root),
               file=out, flush=True)
     return 0
 

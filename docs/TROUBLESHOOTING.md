@@ -158,10 +158,11 @@ the normal launcher start the product again. It recognizes `LeagueClientUx`,
 is running or when a managed client window is visible, and fails closed when
 X11/Xwayland properties are missing or unreadable. This saves the Darling
 bootstrap but not the Riot Client/CEF startup itself. The stale tree is signalled
-deepest-first so live parents can still reap their own children; anything that is
-left over is reparented to the guest launchd, which reaps untracked zombies
-within a few seconds, so a full runtime restart is not needed to clear them. If no
-window appears afterward, use a full runtime shutdown/restart.
+deepest-first so live parents can still reap their own children. Untracked
+zombies adopted by the guest launchd are reaped within a few seconds, so they do
+not need a full runtime restart. A live process that survives SIGKILL is not
+cleaned up by that timer; if one remains, use a full runtime shutdown/restart.
+If no window appears afterward, use a full runtime shutdown/restart.
 
 ### Multiple client-in-game helpers
 

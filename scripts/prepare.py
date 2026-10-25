@@ -4,7 +4,7 @@ import argparse,json,os,subprocess,tempfile,sys
 from pathlib import Path
 # --check-only must not create import caches in the source package either.
 sys.dont_write_bytecode=True
-from common import ROOT,render
+from common import ROOT,render,lfs_pointers
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source',type=Path,default=ROOT/'build/darling-src')
 p.add_argument('--jobs',type=int,default=4,help='parallel submodule fetches')
@@ -19,10 +19,6 @@ LFS_FILTERS=['-c','filter.lfs.required=true','-c','filter.lfs.smudge=git-lfs smu
 def submodules(checkout):
     out=subprocess.run(['git','-C',str(checkout),'submodule','status','--recursive'],text=True,capture_output=True).stdout
     return [checkout/line.split()[1] for line in out.splitlines() if len(line.split())>1]
-def pointers(repo):
-    """Tracked files still checked out as LFS pointer text instead of their real content."""
-    out=subprocess.run(['git','-C',str(repo),'lfs','ls-files'],text=True,capture_output=True).stdout
-    return [f for f in (line.split(maxsplit=2) for line in out.splitlines()) if len(f)==3 and f[1]=='-']
 def repair(checkout):
     """An interrupted fetch leaves a submodule with a wiped index or pointer text and 'submodule update'
     treats both as up to date, so check every worktree before this checkout becomes the source tree."""
@@ -32,12 +28,12 @@ def repair(checkout):
                                              capture_output=True).stdout.strip():
             print(f'Repairing the interrupted checkout of {name}',flush=True)
             run(['git','-C',str(repo),'checkout','-f','HEAD'],stdout=subprocess.DEVNULL)
-        if pointers(repo):
+        if lfs_pointers(repo):
             print(f'Fetching the Git LFS objects of {name} (pointer text is not a library)',flush=True)
             run(['git','-C',str(repo),'lfs','install','--local'],stdout=subprocess.DEVNULL)
             run(['git','-C',str(repo),*(['-c',LFS_URL] if 'swift' in name.parts else []),'lfs','pull'],
                 stdout=subprocess.DEVNULL)
-            if pointers(repo):raise SystemExit(f'{name}: Git LFS objects are still missing; install git-lfs and run this again')
+            if lfs_pointers(repo):raise SystemExit(f'{name}: Git LFS objects are still missing; install git-lfs and run this again')
 
 def applies(repo,patch,reverse=False):
     return subprocess.run(['git','-C',str(repo),'apply',*(['--reverse'] if reverse else []),'--check','-'],input=patch,text=True,

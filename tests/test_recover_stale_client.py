@@ -150,6 +150,37 @@ class RecoverStaleClientTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn('still present after SIGKILL', output)
         self.assertIn('parent PID(s): 0', output)
+        self.assertIn('1 live process(es)', output)
+        self.assertIn('live survivors need a full runtime restart', output)
+        self.assertNotIn('reaps untracked zombies', output)
+
+    def test_zombie_leftover_message_explains_the_reaper(self):
+        self.process(10, 'darlingserver', ['darlingserver'])
+        self.process(12, 'mldr', [CLIENT], self.client_env())
+        stat_file = self.proc / '12/stat'
+        stat = stat_file.read_text()
+        fields = stat.rsplit(')', 1)[1].split()
+        fields[0] = 'Z'
+        stat_file.write_text(stat.rsplit(')', 1)[0] + ') ' + ' '.join(fields) + '\n')
+        message = recover_stale_client.leftover_message([12], self.proc)
+        self.assertIn('1 zombie(s)', message)
+        self.assertIn('guest launchd reaps untracked zombies', message)
+        self.assertNotIn('live survivors', message)
+
+    def test_mixed_leftover_message_reports_both_states(self):
+        self.process(10, 'darlingserver', ['darlingserver'])
+        self.process(12, 'mldr', [CLIENT], self.client_env())
+        self.process(13, 'mldr', [CLIENT], self.client_env())
+        stat_file = self.proc / '12/stat'
+        stat = stat_file.read_text()
+        fields = stat.rsplit(')', 1)[1].split()
+        fields[0] = 'Z'
+        stat_file.write_text(stat.rsplit(')', 1)[0] + ') ' + ' '.join(fields) + '\n')
+        message = recover_stale_client.leftover_message([12, 13], self.proc)
+        self.assertIn('1 zombie(s)', message)
+        self.assertIn('1 live process(es)', message)
+        self.assertIn('guest launchd reaps untracked zombies', message)
+        self.assertIn('live survivors need a full runtime restart', message)
 
     def test_reused_pid_is_not_reported_as_a_leftover(self):
         folder = self.process(12, 'mldr', [CLIENT], self.client_env())

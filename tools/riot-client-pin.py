@@ -75,15 +75,22 @@ def staged_updates(app):
 
 
 def running(proc_root='/proc'):
-    """True when a Riot Client process of any prefix is alive; edits then race the updater."""
+    """True when a Riot Client process of any prefix is alive; edits then race the updater.
+
+    Only the executable is inspected. Matching the whole command line also hit any
+    shell, editor or `grep` that merely named the bundle path, including the command
+    that asked for the pin, so a relative `system.yaml` open would block every write.
+    """
     for entry in Path(proc_root).iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            command = (entry / 'cmdline').read_bytes().replace(b'\0', b' ').decode(errors='replace')
+            fields = (entry / 'cmdline').read_bytes().split(b'\0')
         except OSError:
             continue
-        if 'Riot Client.app/' in command or 'RiotClientServices' in command:
+        executable = Path(fields[0].decode(errors='replace')).name
+        if executable in ('RiotClientServices', 'RiotClientUx') or \
+                executable.startswith('Riot Client'):
             return True
     return False
 
@@ -132,7 +139,7 @@ def backup(app, metadata, destination, dry_run=False):
         copy_tree(metadata, target / 'Metadata')
     (target / 'PIN.txt').write_text(
         f'release {release}\n'
-        f'self_update {self_update_enabled(target / Path(app).name)}\n'
+        f"self_update {str(self_update_enabled(target / Path(app).name)).lower()}\n"
         f'backed_up {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
     return target
 

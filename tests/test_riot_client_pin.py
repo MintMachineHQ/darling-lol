@@ -141,6 +141,47 @@ class StagedUpdateTests(unittest.TestCase):
             self.assertEqual(pin.staged_updates(pin.install_paths(prefix)[0]), [])
 
 
+class RunningTests(unittest.TestCase):
+    def proc_tree(self, root, *commands):
+        """Fake /proc entries from argv lists; paths contain spaces, so no shell parsing."""
+        for index, argv in enumerate(commands, start=100):
+            entry = Path(root) / str(index)
+            entry.mkdir()
+            (entry / 'cmdline').write_bytes(b'\0'.join(a.encode() for a in argv) + b'\0')
+        return Path(root)
+
+    def test_a_client_executable_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.proc_tree(tmp, ['/Users/Shared/Riot Games/Riot Client.app/Contents/MacOS/RiotClientServices',
+                                        '--app-port=1'])
+            self.assertTrue(pin.running(root))
+
+    def test_electron_main_and_helper_names_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.proc_tree(tmp, ['Riot Client.app/Contents/MacOS/Riot Client', '--type=renderer'])
+            self.assertTrue(pin.running(root))
+
+    def test_naming_the_bundle_without_running_it_is_not_running(self):
+        """A shell, editor or grep that mentions the path used to block every write."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.proc_tree(
+                tmp,
+                ['/usr/bin/bash', '-c', 'grep enable_self_update "/Users/Shared/Riot Games/Riot Client.app/Contents/Resources/system.yaml"'],
+                ['python3', 'tools/riot-client-pin.py', '--pin'],
+                ['/usr/bin/cp', '-a', '/Users/Shared/Riot Games/Riot Client.app', '/backup'])
+            self.assertFalse(pin.running(root))
+
+    def test_an_empty_or_unreadable_entry_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / '55').mkdir()
+            (root / 'not-a-pid').mkdir()
+            self.assertFalse(pin.running(root))
+
+    def test_the_real_process_table_is_not_reported_as_a_client(self):
+        self.assertFalse(pin.running())
+
+
 class BackupTests(unittest.TestCase):
     def test_backup_keeps_bundle_metadata_and_a_note(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -149,7 +190,9 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(target.name, KNOWN)
             self.assertTrue((target / 'Riot Client.app/Contents/MacOS/RiotClientServices').is_file())
             self.assertTrue((target / 'Metadata/Riot Client.manifest').is_file())
-            self.assertIn('release 42E1358C87FB3ABC', (target / 'PIN.txt').read_text())
+            note = (target / 'PIN.txt').read_text()
+            self.assertIn('release 42E1358C87FB3ABC', note)
+            self.assertIn('self_update true', note)
 
     def test_backup_refuses_to_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:

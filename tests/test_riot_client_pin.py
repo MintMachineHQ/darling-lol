@@ -1,0 +1,261 @@
+"""Fixture-tree tests for tools/riot-client-pin.py: no guest, no real prefix, no copy of 1 GB."""
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('riot_client_pin', ROOT / 'tools/riot-client-pin.py')
+pin = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pin)
+
+KNOWN = '42E1358C87FB3ABC'
+
+SYSTEM_YAML = """---
+allow_insecure_content: true
+app:
+  app_name: Riot Client
+  respawn: null
+enable_self_update: true
+insecure_tls_versions: true
+"""
+
+
+def make_prefix(root, release=KNOWN, self_update='enable_self_update: true\n', partial=True):
+    """A prefix shaped like an instal: bundle, metadata and a staged .partial-* directory."""
+    shared = Path(root) / 'Users/Shared/Riot Games'
+    app = shared / 'Riot Client.app'
+    (app / 'Contents/Resources').mkdir(parents=True)
+    (app / 'Contents/Resources/system.yaml').write_text(SYSTEM_YAML.replace(
+        'enable_self_update: true\n', self_update))
+    (app / 'Contents/MacOS').mkdir()
+    (app / 'Contents/MacOS/RiotClientServices').write_text('binary\n')
+    metadata = shared / 'Metadata/Riot Client'
+    metadata.mkdir(parents=True)
+    if release:
+        (metadata / 'Riot Client.ok').write_text(
+            f'https://ks-foundation.secure.dyn.riotcdn.net/channels/public/releases/{release}.manifest\n')
+        (metadata / 'Riot Client.manifest').write_bytes(b'RMAN')
+    if partial:
+        (shared / 'Riot Client.app.partial-2336/Contents').mkdir(parents=True)
+    return Path(root), app, metadata
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_release_id_reads_the_manifest_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, metadata = make_prefix(tmp)
+            self.assertEqual(pin.release_id(metadata), KNOWN)
+
+    def test_release_id_is_upper_case_and_tolerates_crlf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, metadata = make_prefix(tmp, release=KNOWN.lower())
+            (metadata / 'Riot Client.ok').write_text(
+                f'https://cdn/releases/{KNOWN.lower()}.manifest\r\n')
+            self.assertEqual(pin.release_id(metadata), KNOWN)
+
+    def test_missing_or_unrelated_metadata_is_not_a_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, metadata = make_prefix(tmp, release=None)
+            self.assertIsNone(pin.release_id(metadata))
+            (metadata / 'Riot Client.ok').write_text('https://cdn/channels/public\n')
+            self.assertIsNone(pin.release_id(metadata))
+            self.assertIsNone(pin.release_id(Path(tmp) / 'nowhere'))
+
+    def test_known_good_release_is_recognised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp)
+            state = pin.describe(prefix)
+            self.assertTrue(state['installed'])
+            self.assertTrue(state['known_good'])
+
+    def test_other_release_is_reported_as_not_known_good(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp, release='6E813D498F26C657')
+            self.assertFalse(pin.describe(prefix)['known_good'])
+
+
+class SelfUpdateTests(unittest.TestCase):
+    def test_reads_the_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            self.assertTrue(pin.self_update_enabled(app))
+            (app / 'Contents/Resources/system.yaml').write_text(
+                SYSTEM_YAML.replace('enable_self_update: true', 'enable_self_update: false'))
+            self.assertFalse(pin.self_update_enabled(app))
+
+    def test_missing_setting_or_bundle_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp, self_update='')
+            self.assertIsNone(pin.self_update_enabled(app))
+            self.assertIsNone(pin.self_update_enabled(Path(tmp) / 'nowhere'))
+
+    def test_pin_rewrites_only_that_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            before = (app / 'Contents/Resources/system.yaml').read_text().splitlines()
+            self.assertFalse(pin.set_self_update(app, False))
+            after = (app / 'Contents/Resources/system.yaml').read_text()
+            changed = [line for line in after.splitlines() if line.startswith('enable_self_update')]
+            self.assertEqual(changed, ['enable_self_update: false'])
+            self.assertEqual(len(before), len(after.splitlines()))
+            self.assertFalse((app / 'Contents/Resources/system.yaml.new').exists())
+            self.assertFalse(pin.self_update_enabled(app))
+
+    def test_pin_is_idempotent_and_unpin_restores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            pin.set_self_update(app, False)
+            pin.set_self_update(app, False)
+            self.assertFalse(pin.self_update_enabled(app))
+            pin.set_self_update(app, True)
+            self.assertTrue(pin.self_update_enabled(app))
+
+    def test_a_bundle_without_the_setting_is_refused(self):
+        """Riot's generator can rename the key; silently doing nothing would be worse."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp, self_update='')
+            with self.assertRaises(SystemExit):
+                pin.set_self_update(app, False)
+
+    def test_trailing_newline_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            path = app / 'Contents/Resources/system.yaml'
+            path.write_text('a: 1\nenable_self_update: true')
+            pin.set_self_update(app, False)
+            self.assertEqual(path.read_text(), 'a: 1\nenable_self_update: false')
+
+
+class StagedUpdateTests(unittest.TestCase):
+    def test_staged_bundles_are_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp)
+            self.assertEqual([p.name for p in pin.staged_updates(pin.install_paths(prefix)[0])],
+                             ['Riot Client.app.partial-2336'])
+
+    def test_no_staged_bundle_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp, partial=False)
+            self.assertEqual(pin.staged_updates(pin.install_paths(prefix)[0]), [])
+
+
+class BackupTests(unittest.TestCase):
+    def test_backup_keeps_bundle_metadata_and_a_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            target = pin.backup(app, metadata, Path(tmp) / 'kept')
+            self.assertEqual(target.name, KNOWN)
+            self.assertTrue((target / 'Riot Client.app/Contents/MacOS/RiotClientServices').is_file())
+            self.assertTrue((target / 'Metadata/Riot Client.manifest').is_file())
+            self.assertIn('release 42E1358C87FB3ABC', (target / 'PIN.txt').read_text())
+
+    def test_backup_refuses_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            pin.backup(app, metadata, Path(tmp) / 'kept')
+            with self.assertRaises(SystemExit):
+                pin.backup(app, metadata, Path(tmp) / 'kept')
+
+    def test_backup_without_metadata_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp, release=None)
+            target = pin.backup(app, metadata, Path(tmp) / 'kept')
+            self.assertTrue(target.name.startswith('unknown-'))
+
+    def test_dry_run_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            pin.backup(app, metadata, Path(tmp) / 'kept', dry_run=True)
+            self.assertFalse((Path(tmp) / 'kept').exists())
+
+
+class RestoreTests(unittest.TestCase):
+    def test_restore_swaps_the_bundle_and_keeps_the_old_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            pin.backup(app, metadata, Path(tmp) / 'kept')
+            # The updater replaced the working bundle with a newer, broken one.
+            (app / 'Contents/Resources/system.yaml').write_text(
+                SYSTEM_YAML.replace('enable_self_update: true', 'enable_self_update: true') + '# 142\n')
+            replaced = pin.restore(app, Path(tmp) / 'kept')
+            self.assertTrue(replaced.is_dir())
+            self.assertIn('# 142', (replaced / 'Contents/Resources/system.yaml').read_text())
+            self.assertNotIn('# 142', (app / 'Contents/Resources/system.yaml').read_text())
+            self.assertTrue((app / 'Contents/MacOS/RiotClientServices').is_file())
+
+    def test_restore_rejects_a_directory_without_a_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            empty = Path(tmp) / 'kept'
+            empty.mkdir()
+            with self.assertRaises(SystemExit):
+                pin.restore(app, empty)
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_status_flag_reports_and_changes_nothing(self):
+        """Docs tell people to run --status, so it must be a real flag and stay read-only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, _ = make_prefix(tmp)
+            with patch.object(pin, 'running', return_value=False):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--status']), 0)
+            self.assertTrue(pin.self_update_enabled(app))
+            self.assertEqual(len(pin.staged_updates(app)), 1)
+
+    def test_status_on_a_missing_prefix_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(pin.main(['--prefix', str(Path(tmp) / 'empty')]), 1)
+
+    def test_a_write_is_refused_while_the_client_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, _ = make_prefix(tmp)
+            with patch.object(pin, 'running', return_value=True):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--pin']), 1)
+            self.assertTrue(pin.self_update_enabled(app))
+
+    def test_pin_and_discard_partial_through_the_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, _ = make_prefix(tmp)
+            with patch.object(pin, 'running', return_value=False):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--pin', '--discard-partial']), 0)
+            self.assertFalse(pin.self_update_enabled(app))
+            self.assertEqual(pin.staged_updates(app), [])
+
+    def test_pin_and_backup_run_together(self):
+        """The documented command keeps a copy and pins in one go."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, _ = make_prefix(tmp)
+            kept = Path(tmp) / 'kept'
+            with patch.object(pin, 'running', return_value=False):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--backup', str(kept),
+                                           '--pin', '--discard-partial']), 0)
+            self.assertFalse(pin.self_update_enabled(app))
+            self.assertTrue((kept / KNOWN / 'Riot Client.app').is_dir())
+            self.assertEqual(pin.staged_updates(app), [])
+
+    def test_status_with_an_action_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp)
+            with self.assertRaises(SystemExit), patch.object(pin, 'running', return_value=False):
+                pin.main(['--prefix', str(prefix), '--status', '--pin'])
+
+    def test_discard_partial_alone_is_refused(self):
+        """It deletes a directory, so it may not be a bare accident."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, _, _ = make_prefix(tmp)
+            with self.assertRaises(SystemExit), patch.object(pin, 'running', return_value=False):
+                pin.main(['--prefix', str(prefix), '--discard-partial'])
+
+    def test_dry_run_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, _ = make_prefix(tmp)
+            with patch.object(pin, 'running', return_value=False):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--pin', '--dry-run']), 0)
+            self.assertTrue(pin.self_update_enabled(app))
+            self.assertEqual(len(pin.staged_updates(app)), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

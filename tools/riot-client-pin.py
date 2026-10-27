@@ -77,9 +77,10 @@ def staged_updates(app):
 def running(proc_root='/proc'):
     """True when a Riot Client process of any prefix is alive; edits then race the updater.
 
-    Only the executable is inspected. Matching the whole command line also hit any
-    shell, editor or `grep` that merely named the bundle path, including the command
-    that asked for the pin, so a relative `system.yaml` open would block every write.
+    Only argv[0] is inspected. The launcher starts the client's own binary, so the
+    process that matters always carries its name. Matching every argument instead
+    made any shell, editor or `grep` that named the bundle path block all writes,
+    including the command that asked for the pin and the backup copy it made.
     """
     for entry in Path(proc_root).iterdir():
         if not entry.name.isdigit():
@@ -88,7 +89,10 @@ def running(proc_root='/proc'):
             fields = (entry / 'cmdline').read_bytes().split(b'\0')
         except OSError:
             continue
-        executable = Path(fields[0].decode(errors='replace')).name
+        arguments = [field.decode(errors='replace') for field in fields if field]
+        if not arguments:
+            continue
+        executable = Path(arguments[0]).name
         if executable in ('RiotClientServices', 'RiotClientUx') or \
                 executable.startswith('Riot Client'):
             return True

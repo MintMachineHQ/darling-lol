@@ -228,6 +228,27 @@ class RestoreTests(unittest.TestCase):
             self.assertNotIn('# 142', (app / 'Contents/Resources/system.yaml').read_text())
             self.assertTrue((app / 'Contents/MacOS/RiotClientServices').is_file())
 
+    def test_restore_pairs_the_bundle_with_its_release_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, metadata = make_prefix(tmp)
+            saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+            (metadata / 'Riot Client.ok').write_text(
+                'https://cdn/releases/6E813D498F26C657.manifest')
+            replaced = pin.restore(app, saved)
+            self.assertEqual(pin.release_id(metadata), KNOWN)
+            self.assertTrue(pin.describe(prefix)['known_good'])
+            self.assertEqual(pin.release_id(replaced.with_name(
+                replaced.name + '.metadata')), '6E813D498F26C657')
+
+    def test_restore_without_saved_metadata_clears_the_old_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            saved = Path(tmp) / 'saved'
+            saved.mkdir()
+            pin.copy_tree(app, saved / app.name)
+            pin.restore(app, saved)
+            self.assertIsNone(pin.release_id(metadata))
+
     def test_restore_rejects_a_directory_without_a_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, app, _ = make_prefix(tmp)

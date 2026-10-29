@@ -170,6 +170,16 @@ def restore(app, backup_dir, dry_run=False):
     if app.exists():
         app.rename(replaced)
     copy_tree(source, app)
+    # The updater identifies the installed release through this metadata, not
+    # the bundle version. Keep it paired with the restored bundle, and retain
+    # the previous metadata alongside the displaced bundle for recovery.
+    metadata = app.parent / 'Metadata/Riot Client'
+    saved_metadata = source.parent / 'Metadata'
+    if metadata.exists():
+        metadata.rename(replaced.with_name(replaced.name + '.metadata'))
+    if saved_metadata.is_dir():
+        metadata.parent.mkdir(parents=True, exist_ok=True)
+        copy_tree(saved_metadata, metadata)
     return replaced
 
 

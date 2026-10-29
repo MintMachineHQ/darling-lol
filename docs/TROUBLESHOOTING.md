@@ -128,7 +128,9 @@ python3 tools/riot-client-pin.py --restore "$HOME/darling-backups/42E1358C87FB3A
 ```
 
 The replaced bundle is renamed aside as `Riot Client.app.replaced-<timestamp>`,
-never deleted. When a release that runs becomes available, `--unpin` turns
+never deleted. Its release metadata is kept alongside it with a `.metadata`
+suffix, and the saved metadata is restored with the saved bundle. When a release
+that runs becomes available, `--unpin` turns
 self-update back on. Every write refuses to run while a Riot Client process is
 alive, because it would race the updater. `--discard-partial` deletes a
 directory, so it is accepted only together with `--pin` or `--unpin`.

@@ -124,8 +124,14 @@ the plan without changing anything.
 If a launch already installed 142, restore the kept bundle:
 
 ```sh
-python3 tools/riot-client-pin.py --restore "$HOME/darling-backups/42E1358C87FB3ABC"
+python3 tools/riot-client-pin.py --restore "$HOME/darling-backups/42E1358C87FB3ABC" --pin --discard-partial
 ```
+
+Backup and restore run before pinning or discarding staged updates, so `--pin`
+applies to the restored bundle. The backup keeps the settings as they were before
+pinning. Restore also works in a fresh prefix. It stages the saved bundle and
+metadata before replacing either installed path; copy failures preserve the
+installation, and a failed swap rolls back both paths.
 
 The replaced bundle is renamed aside as `Riot Client.app.replaced-<timestamp>`,
 never deleted. Its release metadata is kept alongside it with a `.metadata`

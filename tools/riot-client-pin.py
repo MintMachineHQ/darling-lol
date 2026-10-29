@@ -4,8 +4,9 @@
 Riot Client 142 (Electron 43) crashes under Darling on missing frameworks, and the
 updater replaces the working bundle on the next launch. This tool reports the installed
 release, disables or re-enables self-update, discards a staged update, and keeps a
-restorable copy of the bundle it found. It never modifies anything but the
-`enable_self_update` line and the staged `.partial-*` directory it is asked to remove.
+restorable copy of the bundle it found. Pinning changes only the
+`enable_self_update` line; bundle and release metadata changes require an explicit
+backup or restore, and staged updates are removed only when requested.
 """
 import argparse
 import json
@@ -15,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 SELF_UPDATE = 'enable_self_update:'
@@ -31,7 +33,7 @@ def runtime_prefix(explicit=None):
             return Path(os.environ[name]).expanduser()
     config = Path(__file__).resolve().parent.parent / 'build/config.json'
     try:
-        return Path(json.loads(config.read_text())['prefix'])
+        return Path(json.loads(config.read_text(encoding='utf-8'))['prefix'])
     except (OSError, ValueError, KeyError):
         return Path.home() / '.darling'
 
@@ -45,7 +47,7 @@ def install_paths(prefix):
 def release_id(metadata):
     """The release id from `Riot Client.ok`, which holds the CDN manifest URL."""
     try:
-        text = (Path(metadata) / 'Riot Client.ok').read_text()
+        text = (Path(metadata) / 'Riot Client.ok').read_text(encoding='utf-8')
     except OSError:
         return None
     found = re.search(r'/releases/([0-9A-Fa-f]{16})\.manifest', text)
@@ -55,7 +57,7 @@ def release_id(metadata):
 def self_update_enabled(app):
     """True/False from system.yaml, or None when the setting is absent or unreadable."""
     try:
-        text = (Path(app) / 'Contents/Resources/system.yaml').read_text()
+        text = (Path(app) / 'Contents/Resources/system.yaml').read_text(encoding='utf-8')
     except OSError:
         return None
     for line in text.splitlines():
@@ -106,7 +108,7 @@ def set_self_update(app, enabled, dry_run=False):
     edited in place rather than regenerated: one targeted line, everything else verbatim.
     """
     path = Path(app) / 'Contents/Resources/system.yaml'
-    text = path.read_text()
+    text = path.read_text(encoding='utf-8')
     wanted = 'true' if enabled else 'false'
     lines = text.splitlines(keepends=True)
     replaced = 0
@@ -119,7 +121,7 @@ def set_self_update(app, enabled, dry_run=False):
         raise SystemExit(f"{path}: expected exactly one '{SELF_UPDATE}' line, found {replaced}")
     if not dry_run:
         staged = path.with_name(path.name + '.new')
-        staged.write_text(''.join(lines))
+        staged.write_text(''.join(lines), encoding='utf-8')
         staged.replace(path)
     return enabled
 
@@ -144,16 +146,12 @@ def backup(app, metadata, destination, dry_run=False):
     (target / 'PIN.txt').write_text(
         f'release {release}\n'
         f"self_update {str(self_update_enabled(target / Path(app).name)).lower()}\n"
-        f'backed_up {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
+        f'backed_up {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n', encoding='utf-8')
     return target
 
 
-def restore(app, backup_dir, dry_run=False):
-    """Swap a backup in, keeping the replaced bundle next to it instead of deleting it.
-
-    Accepts either the directory `--backup` printed or the directory it was given, so
-    `--restore build/riot-client-keep` works whether or not the release level is spelled out.
-    """
+def restore_source(app, backup_dir):
+    """Resolve either a release directory or a parent holding one release."""
     root = Path(backup_dir).expanduser()
     source = root / Path(app).name
     if not source.is_dir():
@@ -163,23 +161,61 @@ def restore(app, backup_dir, dry_run=False):
         if len(candidates) != 1:
             raise SystemExit(f'{source} does not exist; pass the directory printed by --backup')
         source = candidates[0]
+    return source
+
+
+def restore(app, backup_dir, dry_run=False):
+    """Stage the saved bundle and metadata, then swap them in together.
+
+    Preserve displaced files for recovery, and roll back both paths if the
+    swap fails. A failed copy never touches the installed release.
+    """
+    source = restore_source(app, backup_dir)
     app = Path(app)
     replaced = app.with_name(f'{app.name}.replaced-{time.strftime("%Y%m%d-%H%M%S")}')
+    metadata = app.parent / 'Metadata/Riot Client'
+    suffix = 0
+    candidate = replaced
+    while candidate.exists() or candidate.with_name(candidate.name + '.metadata').exists():
+        suffix += 1
+        candidate = replaced.with_name(f'{replaced.name}-{suffix}')
+    replaced = candidate
+    kept_metadata = replaced.with_name(replaced.name + '.metadata')
     if dry_run:
         return replaced
-    if app.exists():
-        app.rename(replaced)
-    copy_tree(source, app)
-    # The updater identifies the installed release through this metadata, not
-    # the bundle version. Keep it paired with the restored bundle, and retain
-    # the previous metadata alongside the displaced bundle for recovery.
-    metadata = app.parent / 'Metadata/Riot Client'
-    saved_metadata = source.parent / 'Metadata'
-    if metadata.exists():
-        metadata.rename(replaced.with_name(replaced.name + '.metadata'))
-    if saved_metadata.is_dir():
-        metadata.parent.mkdir(parents=True, exist_ok=True)
-        copy_tree(saved_metadata, metadata)
+    app.parent.mkdir(parents=True, exist_ok=True)
+    # Stage on the destination filesystem so publishing uses atomic renames.
+    with tempfile.TemporaryDirectory(prefix='.riot-client-restore-', dir=app.parent) as tmp:
+        staged_app = Path(tmp) / app.name
+        staged_metadata = Path(tmp) / 'Metadata'
+        copy_tree(source, staged_app)
+        saved_metadata = source.parent / 'Metadata'
+        if saved_metadata.is_dir():
+            copy_tree(saved_metadata, staged_metadata)
+            metadata.parent.mkdir(parents=True, exist_ok=True)
+        moved_app = moved_metadata = installed_app = installed_metadata = False
+        try:
+            if app.exists():
+                app.rename(replaced)
+                moved_app = True
+            if metadata.exists():
+                metadata.rename(kept_metadata)
+                moved_metadata = True
+            staged_app.rename(app)
+            installed_app = True
+            if staged_metadata.exists():
+                staged_metadata.rename(metadata)
+                installed_metadata = True
+        except OSError:
+            if installed_metadata:
+                shutil.rmtree(metadata)
+            if installed_app:
+                shutil.rmtree(app)
+            if moved_metadata:
+                kept_metadata.rename(metadata)
+            if moved_app:
+                replaced.rename(app)
+            raise
     return replaced
 
 
@@ -259,8 +295,17 @@ def main(argv=None):
     elif not writing:
         return report(state)
 
+    if args.backup:
+        target = backup(app, metadata, args.backup, args.dry_run)
+        print(f"kept {app} as {target}{' (dry run)' if args.dry_run else ''}")
+    if args.restore:
+        replaced = restore(app, args.restore, args.dry_run)
+        print(f"restored from {args.restore}; previous bundle kept at {replaced}"
+              f"{' (dry run)' if args.dry_run else ''}")
     if args.pin or args.unpin:
-        enabled = set_self_update(app, args.unpin, args.dry_run)
+        # A dry run validates the saved bundle without publishing it first.
+        pin_app = restore_source(app, args.restore) if args.restore and args.dry_run else app
+        enabled = set_self_update(pin_app, args.unpin, args.dry_run)
         print(f"self-update {'enabled' if enabled else 'disabled'}"
               f"{' (dry run)' if args.dry_run else ''}")
         if args.discard_partial:
@@ -271,13 +316,6 @@ def main(argv=None):
                 print(f"removing {partial}{' (dry run)' if args.dry_run else ''}")
                 if not args.dry_run:
                     shutil.rmtree(partial)
-    if args.backup:
-        target = backup(app, metadata, args.backup, args.dry_run)
-        print(f"kept {app} as {target}{' (dry run)' if args.dry_run else ''}")
-    if args.restore:
-        replaced = restore(app, args.restore, args.dry_run)
-        print(f"restored from {args.restore}; previous bundle kept at {replaced}"
-              f"{' (dry run)' if args.dry_run else ''}")
     return 0
 
 

@@ -2,6 +2,9 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import subprocess
+import os
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -119,6 +122,21 @@ class SelfUpdateTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 pin.set_self_update(app, False)
 
+    def test_utf8_settings_survive_pinning_in_an_ascii_locale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            path = app / 'Contents/Resources/system.yaml'
+            content = 'label: Français\nenable_self_update: true\n'
+            path.write_bytes(content.encode('utf-8'))
+            code = ('import importlib.util,sys; '
+                    's=importlib.util.spec_from_file_location("pin",sys.argv[1]); '
+                    'm=importlib.util.module_from_spec(s); s.loader.exec_module(m); '
+                    'm.set_self_update(sys.argv[2],False)')
+            subprocess.run([sys.executable, '-c', code, str(ROOT / 'tools/riot-client-pin.py'),
+                            str(app)], check=True, capture_output=True,
+                           env=dict(os.environ, LC_ALL='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0'))
+            self.assertEqual(path.read_bytes(), content.replace('true', 'false').encode('utf-8'))
+
     def test_trailing_newline_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, app, _ = make_prefix(tmp)
@@ -178,8 +196,10 @@ class RunningTests(unittest.TestCase):
             (root / 'not-a-pid').mkdir()
             self.assertFalse(pin.running(root))
 
-    def test_the_real_process_table_is_not_reported_as_a_client(self):
-        self.assertFalse(pin.running())
+    def test_unrelated_process_table_is_not_reported_as_a_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.proc_tree(tmp, ['/usr/bin/python3', 'tools/riot-client-pin.py'])
+            self.assertFalse(pin.running(root))
 
 
 class BackupTests(unittest.TestCase):
@@ -249,6 +269,64 @@ class RestoreTests(unittest.TestCase):
             pin.restore(app, saved)
             self.assertIsNone(pin.release_id(metadata))
 
+    def test_copy_failures_leave_the_installed_release_unchanged(self):
+        for failing_copy in (1, 2):
+            with self.subTest(copy=failing_copy), tempfile.TemporaryDirectory() as tmp:
+                _, app, metadata = make_prefix(tmp)
+                saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+                (app / 'Contents/Resources/system.yaml').write_text('current bundle')
+                (metadata / 'Riot Client.ok').write_text('current metadata')
+                copy = pin.copy_tree
+                calls = 0
+
+                def interrupted(source, destination):
+                    nonlocal calls
+                    calls += 1
+                    if calls == failing_copy:
+                        Path(destination).mkdir()
+                        (Path(destination) / 'partial').write_text('incomplete')
+                        raise subprocess.CalledProcessError(1, ['cp'])
+                    copy(source, destination)
+
+                with patch.object(pin, 'copy_tree', side_effect=interrupted):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        pin.restore(app, saved)
+                self.assertEqual((app / 'Contents/Resources/system.yaml').read_text(), 'current bundle')
+                self.assertEqual((metadata / 'Riot Client.ok').read_text(), 'current metadata')
+                self.assertEqual(list(app.parent.glob('.riot-client-restore-*')), [])
+                self.assertEqual(list(app.parent.glob('Riot Client.app.replaced-*')), [])
+
+    def test_metadata_publish_failure_rolls_back_both_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+            (app / 'Contents/Resources/system.yaml').write_text('current bundle')
+            (metadata / 'Riot Client.ok').write_text('current metadata')
+            rename = Path.rename
+
+            def interrupted(source, destination):
+                if source.name == 'Metadata' and destination == metadata:
+                    raise OSError('metadata publish failed')
+                return rename(source, destination)
+
+            with patch.object(Path, 'rename', interrupted):
+                with self.assertRaisesRegex(OSError, 'metadata publish failed'):
+                    pin.restore(app, saved)
+            self.assertEqual((app / 'Contents/Resources/system.yaml').read_text(), 'current bundle')
+            self.assertEqual((metadata / 'Riot Client.ok').read_text(), 'current metadata')
+            self.assertEqual(list(app.parent.glob('Riot Client.app.replaced-*')), [])
+
+    def test_repeated_restores_keep_each_displaced_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+            with patch.object(pin.time, 'strftime', return_value='same-second'):
+                first = pin.restore(app, saved)
+                second = pin.restore(app, saved)
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_dir())
+            self.assertTrue(second.is_dir())
+
     def test_restore_rejects_a_directory_without_a_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, app, _ = make_prefix(tmp)
@@ -297,7 +375,46 @@ class CommandLineTests(unittest.TestCase):
                                            '--pin', '--discard-partial']), 0)
             self.assertFalse(pin.self_update_enabled(app))
             self.assertTrue((kept / KNOWN / 'Riot Client.app').is_dir())
+            self.assertTrue(pin.self_update_enabled(kept / KNOWN / 'Riot Client.app'))
             self.assertEqual(pin.staged_updates(app), [])
+
+    def test_restore_then_pin_in_existing_and_fresh_prefixes(self):
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as tmp:
+                prefix, app, metadata = make_prefix(tmp)
+                saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+                if fresh:
+                    prefix = Path(tmp) / 'fresh'
+                    app, metadata = pin.install_paths(prefix)
+                with patch.object(pin, 'running', return_value=False):
+                    self.assertEqual(pin.main(['--prefix', str(prefix), '--restore',
+                                               str(saved), '--pin']), 0)
+                self.assertFalse(pin.self_update_enabled(app))
+                self.assertEqual(pin.release_id(metadata), KNOWN)
+                self.assertTrue(pin.self_update_enabled(saved / app.name))
+
+    def test_restore_pin_dry_run_in_a_fresh_prefix_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, metadata = make_prefix(tmp)
+            saved = pin.backup(app, metadata, Path(tmp) / 'kept')
+            prefix = Path(tmp) / 'fresh'
+            with patch.object(pin, 'running', return_value=False):
+                self.assertEqual(pin.main(['--prefix', str(prefix), '--restore',
+                                           str(saved), '--pin', '--dry-run']), 0)
+            self.assertFalse(prefix.exists())
+            self.assertTrue(pin.self_update_enabled(saved / app.name))
+
+    def test_failed_backup_does_not_pin_or_discard_staged_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix, app, metadata = make_prefix(tmp)
+            kept = Path(tmp) / 'kept'
+            pin.backup(app, metadata, kept)
+            with patch.object(pin, 'running', return_value=False):
+                with self.assertRaises(SystemExit):
+                    pin.main(['--prefix', str(prefix), '--backup', str(kept),
+                              '--pin', '--discard-partial'])
+            self.assertTrue(pin.self_update_enabled(app))
+            self.assertEqual(len(pin.staged_updates(app)), 1)
 
     def test_status_with_an_action_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

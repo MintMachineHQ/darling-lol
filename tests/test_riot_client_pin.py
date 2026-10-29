@@ -137,6 +137,19 @@ class SelfUpdateTests(unittest.TestCase):
                            env=dict(os.environ, LC_ALL='C', PYTHONUTF8='0', PYTHONCOERCECLOCALE='0'))
             self.assertEqual(path.read_bytes(), content.replace('true', 'false').encode('utf-8'))
 
+    def test_nested_self_update_keeps_its_parent_and_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, app, _ = make_prefix(tmp)
+            path = app / 'Contents/Resources/system.yaml'
+            text = 'updater:\n  enable_self_update: true\n  channel: live\nother: unchanged\n'
+            path.write_text(text, encoding='utf-8')
+            pin.set_self_update(app, False)
+            self.assertEqual(path.read_text(encoding='utf-8'),
+                             text.replace('enable_self_update: true', 'enable_self_update: false'))
+            self.assertFalse(pin.self_update_enabled(app))
+            pin.set_self_update(app, True)
+            self.assertEqual(path.read_text(encoding='utf-8'), text)
+
     def test_trailing_newline_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             _, app, _ = make_prefix(tmp)

@@ -114,8 +114,9 @@ def set_self_update(app, enabled, dry_run=False):
     replaced = 0
     for index, line in enumerate(lines):
         if line.strip().startswith(SELF_UPDATE):
+            indent = line[:len(line) - len(line.lstrip(' \t'))]
             newline = '\n' if line.endswith('\n') else ''
-            lines[index] = f'{SELF_UPDATE} {wanted}{newline}'
+            lines[index] = f'{indent}{SELF_UPDATE} {wanted}{newline}'
             replaced += 1
     if replaced != 1:
         raise SystemExit(f"{path}: expected exactly one '{SELF_UPDATE}' line, found {replaced}")
